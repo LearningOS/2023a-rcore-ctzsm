@@ -16,7 +16,10 @@ mod task;
 
 use crate::loader::{get_app_data, get_num_app};
 use crate::sync::UPSafeCell;
+use crate::syscall::process::TaskInfo;
+use crate::timer::get_time_ms;
 use crate::trap::TrapContext;
+use crate::mm::{VirtAddr, MapPermission};
 use alloc::vec::Vec;
 use lazy_static::*;
 use switch::__switch;
@@ -78,7 +81,10 @@ impl TaskManager {
     fn run_first_task(&self) -> ! {
         let mut inner = self.inner.exclusive_access();
         let next_task = &mut inner.tasks[0];
-        next_task.task_status = TaskStatus::Running;
+        next_task.task_info.status = TaskStatus::Running;
+        if next_task.task_info.time == 0 {
+            next_task.task_info.time = get_time_ms();
+        }
         let next_task_cx_ptr = &next_task.task_cx as *const TaskContext;
         drop(inner);
         let mut _unused = TaskContext::zero_init();
@@ -93,14 +99,14 @@ impl TaskManager {
     fn mark_current_suspended(&self) {
         let mut inner = self.inner.exclusive_access();
         let cur = inner.current_task;
-        inner.tasks[cur].task_status = TaskStatus::Ready;
+        inner.tasks[cur].task_info.status = TaskStatus::Ready;
     }
 
     /// Change the status of current `Running` task into `Exited`.
     fn mark_current_exited(&self) {
         let mut inner = self.inner.exclusive_access();
         let cur = inner.current_task;
-        inner.tasks[cur].task_status = TaskStatus::Exited;
+        inner.tasks[cur].task_info.status = TaskStatus::Exited;
     }
 
     /// Find next task to run and return task id.
@@ -111,7 +117,7 @@ impl TaskManager {
         let current = inner.current_task;
         (current + 1..current + self.num_app + 1)
             .map(|id| id % self.num_app)
-            .find(|id| inner.tasks[*id].task_status == TaskStatus::Ready)
+            .find(|id| inner.tasks[*id].task_info.status == TaskStatus::Ready)
     }
 
     /// Get the current 'Running' task's token.
@@ -139,7 +145,10 @@ impl TaskManager {
         if let Some(next) = self.find_next_task() {
             let mut inner = self.inner.exclusive_access();
             let current = inner.current_task;
-            inner.tasks[next].task_status = TaskStatus::Running;
+            inner.tasks[next].task_info.status = TaskStatus::Running;
+            if inner.tasks[next].task_info.time == 0 {
+                inner.tasks[next].task_info.time = get_time_ms();
+            }
             inner.current_task = next;
             let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut TaskContext;
             let next_task_cx_ptr = &inner.tasks[next].task_cx as *const TaskContext;
@@ -152,6 +161,36 @@ impl TaskManager {
         } else {
             panic!("All applications completed!");
         }
+    }
+
+    /// Make current task syscall count +1.
+    fn current_task_count_add_one(&self, syscall_id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].task_info.syscall_times[syscall_id] += 1;
+    }
+    
+    /// Return the current task info.
+    fn get_current_task_info(&self) -> TaskInfo {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].task_info
+    }
+
+    fn mmap(&self, start: VirtAddr, end: VirtAddr, map_perm: MapPermission) -> isize {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        if !inner.tasks[current].memory_set.exclusive(start, end) {
+            return -1;
+        }
+        inner.tasks[current].memory_set.insert_framed_area(start, end, map_perm);
+        0
+    }
+
+    fn unmap(&self, start: VirtAddr, end: VirtAddr) -> isize {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].memory_set.unmap(start, end)
     }
 }
 
@@ -201,4 +240,38 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// Make current task syscall count +1.
+pub fn current_task_count_add_one(syscall_id: usize) {
+    TASK_MANAGER.current_task_count_add_one(syscall_id);
+}
+
+/// Return the current task info.
+pub fn get_current_task_info() -> TaskInfo {
+    TASK_MANAGER.get_current_task_info()
+}
+
+/// Mmap
+pub fn task_mmap(_start: usize, _len: usize, _prot: usize) -> isize {
+    let start = VirtAddr::from(_start);
+    let end = VirtAddr::from(_start + _len);
+    let mut map_perm = MapPermission::U;
+    if _prot & 1 > 0 {
+        map_perm |= MapPermission::R;
+    }
+    if _prot & 2 > 0 {
+        map_perm |= MapPermission::W;
+    }
+    if _prot & 4 > 0 {
+        map_perm |= MapPermission::X;
+    }
+    TASK_MANAGER.mmap(start, end, map_perm)
+}
+
+/// munmap
+pub fn task_munmap(_start: usize, _len: usize) -> isize {
+    let start = VirtAddr::from(_start);
+    let end = VirtAddr::from(_start + _len);
+    TASK_MANAGER.unmap(start, end)
 }

@@ -70,6 +70,18 @@ impl MemorySet {
         }
         self.areas.push(map_area);
     }
+    /// Unmap range
+    pub fn unmap(&mut self, start: VirtAddr, end: VirtAddr) -> isize {
+        let vpn_range = VPNRange::new(start.floor(), end.ceil());
+        if let Some(index) = self.areas.iter_mut().position(
+            |area| area.vpn_range.get_start() == vpn_range.get_start() && area.vpn_range.get_end() == vpn_range.get_end()) {
+            self.areas[index].unmap(&mut self.page_table);
+            self.areas.remove(index);
+        } else {
+            return -1
+        }
+        0
+    }
     /// Mention that trampoline is not collected by areas.
     fn map_trampoline(&mut self) {
         self.page_table.map(
@@ -262,6 +274,16 @@ impl MemorySet {
             false
         }
     }
+
+    /// check the range is exlusive to all areas or not.
+    pub fn exclusive(&self, start: VirtAddr, end: VirtAddr) -> bool {
+        for area in self.areas.as_slice() {
+            if !area.exclusive(start, end) {
+                return false;
+            }
+        }
+        true
+    }
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {
@@ -271,6 +293,7 @@ pub struct MapArea {
     map_perm: MapPermission,
 }
 
+#[allow(missing_docs)]
 impl MapArea {
     pub fn new(
         start_va: VirtAddr,
@@ -356,8 +379,17 @@ impl MapArea {
             current_vpn.step();
         }
     }
+
+    pub fn exclusive(&self, start: VirtAddr, end: VirtAddr) -> bool {
+        end.ceil() <= self.vpn_range.get_start() || self.vpn_range.get_end() <= start.floor()
+    }
+
+    pub fn include(&self, vpn: VirtPageNum) -> bool {
+        self.vpn_range.get_start() <= vpn && vpn < self.vpn_range.get_end()
+    }
 }
 
+#[allow(missing_docs)]
 #[derive(Copy, Clone, PartialEq, Debug)]
 /// map type for memory set: identical or framed
 pub enum MapType {

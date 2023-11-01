@@ -1,9 +1,10 @@
 //! Types related to task management & Functions for completely changing TCB
 use super::TaskContext;
 use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
-use crate::config::TRAP_CONTEXT_BASE;
-use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
+use crate::config::{TRAP_CONTEXT_BASE, MAX_SYSCALL_NUM};
+use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE, MapPermission};
 use crate::sync::UPSafeCell;
+use crate::syscall::process::TaskInfo;
 use crate::trap::{trap_handler, TrapContext};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -48,7 +49,7 @@ pub struct TaskControlBlockInner {
     pub task_cx: TaskContext,
 
     /// Maintain the execution status of the current process
-    pub task_status: TaskStatus,
+    pub task_info: TaskInfo,
 
     /// Application address space
     pub memory_set: MemorySet,
@@ -80,7 +81,7 @@ impl TaskControlBlockInner {
         self.memory_set.token()
     }
     fn get_status(&self) -> TaskStatus {
-        self.task_status
+        self.task_info.status
     }
     pub fn is_zombie(&self) -> bool {
         self.get_status() == TaskStatus::Zombie
@@ -98,6 +99,11 @@ impl TaskControlBlock {
             .translate(VirtAddr::from(TRAP_CONTEXT_BASE).into())
             .unwrap()
             .ppn();
+        let task_info = TaskInfo {
+            status: TaskStatus::Ready,
+            syscall_times: [0; MAX_SYSCALL_NUM],
+            time: 0,
+        };
         // alloc a pid and a kernel stack in kernel space
         let pid_handle = pid_alloc();
         let kernel_stack = kstack_alloc();
@@ -111,7 +117,7 @@ impl TaskControlBlock {
                     trap_cx_ppn,
                     base_size: user_sp,
                     task_cx: TaskContext::goto_trap_return(kernel_stack_top),
-                    task_status: TaskStatus::Ready,
+                    task_info,
                     memory_set,
                     parent: None,
                     children: Vec::new(),
@@ -176,6 +182,11 @@ impl TaskControlBlock {
         let pid_handle = pid_alloc();
         let kernel_stack = kstack_alloc();
         let kernel_stack_top = kernel_stack.get_top();
+        let task_info = TaskInfo {
+            status: TaskStatus::Ready,
+            syscall_times: [0; MAX_SYSCALL_NUM],
+            time: 0,
+        };
         let task_control_block = Arc::new(TaskControlBlock {
             pid: pid_handle,
             kernel_stack,
@@ -184,7 +195,7 @@ impl TaskControlBlock {
                     trap_cx_ppn,
                     base_size: parent_inner.base_size,
                     task_cx: TaskContext::goto_trap_return(kernel_stack_top),
-                    task_status: TaskStatus::Ready,
+                    task_info,
                     memory_set,
                     parent: Some(Arc::downgrade(self)),
                     children: Vec::new(),
@@ -235,6 +246,46 @@ impl TaskControlBlock {
         } else {
             None
         }
+    }
+
+    /// Make current task syscall count +1.
+    pub fn syscall_count_add_one(&self, syscall_id: usize) {
+        self.inner.exclusive_access().task_info.syscall_times[syscall_id] += 1;
+    }
+
+    /// Return the current task info.
+    pub fn get_task_info(&self) -> TaskInfo {
+        self.inner.exclusive_access().task_info
+    }
+
+    /// mmap
+    pub fn mmap(&self, _start: usize, _len: usize, _prot: usize) -> isize {
+        let start = VirtAddr::from(_start);
+        let end = VirtAddr::from(_start + _len);
+        let mut map_perm = MapPermission::U;
+        if _prot & 1 > 0 {
+            map_perm |= MapPermission::R;
+        }
+        if _prot & 2 > 0 {
+            map_perm |= MapPermission::W;
+        }
+        if _prot & 4 > 0 {
+            map_perm |= MapPermission::X;
+        }
+        let mut inner = self.inner_exclusive_access();
+        if inner.memory_set.exclusive(start, end) {
+            return -1;
+        }
+        inner.memory_set.insert_framed_area(start, end, map_perm);
+        0
+    }
+
+    /// munmap
+    pub fn munmap(&self, _start: usize, _len: usize) -> isize {
+        let start = VirtAddr::from(_start);
+        let end = VirtAddr::from(_start + _len);
+        let mut inner = self.inner_exclusive_access();
+        inner.memory_set.unmap(start, end)
     }
 }
 

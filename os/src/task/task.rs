@@ -10,6 +10,26 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cell::RefMut;
 
+use core::cmp::Ordering;
+
+const BIG_STRIDE: u64 = u32::MAX as u64;
+const DEFAULT_PRIO: usize = 16;
+
+#[derive(Debug)]
+pub struct Stride(u64);
+
+impl PartialOrd for Stride {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some((self.0 as i64).cmp(&(other.0 as i64)))
+    }
+}
+
+impl PartialEq for Stride {
+    fn eq(&self, _other: &Self) -> bool {
+        false
+    }
+}
+
 /// Task control block structure
 ///
 /// Directly save the contents that will not change during running
@@ -69,6 +89,12 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// Priority
+    pub prio: usize,
+
+    /// Stride
+    pub stride: Stride,
 }
 
 impl TaskControlBlockInner {
@@ -85,6 +111,15 @@ impl TaskControlBlockInner {
     }
     pub fn is_zombie(&self) -> bool {
         self.get_status() == TaskStatus::Zombie
+    }
+
+    /// update stride with the current priority.
+    pub fn update_stride(&mut self, add: bool) {
+        if add {
+            self.stride.0 += BIG_STRIDE / (self.prio as u64);
+        } else {
+            self.stride.0 -= BIG_STRIDE / (self.prio as u64);
+        }
     }
 }
 
@@ -124,6 +159,8 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    prio: DEFAULT_PRIO,
+                    stride: Stride(0),
                 })
             },
         };
@@ -202,6 +239,8 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    prio: DEFAULT_PRIO,
+                    stride: Stride(0),
                 })
             },
         });
@@ -215,6 +254,65 @@ impl TaskControlBlock {
         task_control_block
         // **** release child PCB
         // ---- release parent PCB
+    }
+
+    /// Spawn a process and run the elf
+    pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Arc<Self> {
+        // ---- access parent PCB exclusively
+        let mut parent_inner = self.inner_exclusive_access();
+        // create user space(include trap context)
+        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+        let trap_cx_ppn = memory_set
+            .translate(VirtAddr::from(TRAP_CONTEXT_BASE).into())
+            .unwrap()
+            .ppn();
+        // alloc a pid and a kernel stack in kernel space
+        let pid_handle = pid_alloc();
+        let kernel_stack = kstack_alloc();
+        let kernel_stack_top = kernel_stack.get_top();
+        let task_info = TaskInfo {
+            status: TaskStatus::Ready,
+            syscall_times: [0; MAX_SYSCALL_NUM],
+            time: 0,
+        };
+        let task_control_block = Arc::new(TaskControlBlock {
+            pid: pid_handle,
+            kernel_stack,
+            inner: unsafe {
+                UPSafeCell::new(TaskControlBlockInner {
+                    trap_cx_ppn,
+                    base_size: parent_inner.base_size,
+                    task_cx: TaskContext::goto_trap_return(kernel_stack_top),
+                    task_info,
+                    memory_set,
+                    parent: Some(Arc::downgrade(self)),
+                    children: Vec::new(),
+                    exit_code: 0,
+                    heap_bottom: parent_inner.heap_bottom,
+                    program_brk: parent_inner.program_brk,
+                    prio: DEFAULT_PRIO,
+                    stride: Stride(0),
+                })
+            },
+        });
+        // add child
+        parent_inner.children.push(task_control_block.clone());
+        // modify kernel_sp in trap_cx
+        // **** access child PCB exclusively
+        let trap_cx = task_control_block.inner_exclusive_access().get_trap_cx();
+        *trap_cx = TrapContext::app_init_context(
+            entry_point, user_sp, KERNEL_SPACE.exclusive_access().token(),
+             task_control_block.kernel_stack.get_top(), trap_handler as usize);
+        // return
+        task_control_block
+        // **** release child PCB
+        // ---- release parent PCB
+    }
+
+    /// set prio
+    pub fn set_prio(&self, prio: usize) {
+        let mut inner = self.inner_exclusive_access();
+        inner.prio = prio;
     }
 
     /// get pid of process
@@ -273,7 +371,7 @@ impl TaskControlBlock {
             map_perm |= MapPermission::X;
         }
         let mut inner = self.inner_exclusive_access();
-        if inner.memory_set.exclusive(start, end) {
+        if !inner.memory_set.exclusive(start, end) {
             return -1;
         }
         inner.memory_set.insert_framed_area(start, end, map_perm);
@@ -286,6 +384,27 @@ impl TaskControlBlock {
         let end = VirtAddr::from(_start + _len);
         let mut inner = self.inner_exclusive_access();
         inner.memory_set.unmap(start, end)
+    }
+}
+
+impl Ord for TaskControlBlock {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.inner.exclusive_access().stride.partial_cmp(&self.inner.exclusive_access().stride).unwrap()
+    }
+}
+
+impl Eq for TaskControlBlock {
+}
+
+impl PartialOrd for TaskControlBlock {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for TaskControlBlock {
+    fn eq(&self, _other: &Self) -> bool {
+        false
     }
 }
 
